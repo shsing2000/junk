@@ -4,144 +4,214 @@ import (
 	"bufio"
 	"log"
 	"net"
+	"os"
+	"regexp"
 )
 
 type Client struct {
-	id       string
-	incoming chan string
-	outgoing chan string
-	quit     chan *Client
-	reader   *bufio.Reader
-	writer   *bufio.Writer
-}
-
-func (c *Client) Read() {
-	for {
-		line, _ := c.reader.ReadString('\n')
-		if line == "quit\n" {
-			c.quit <- c
-			return
-		}
-
-		c.incoming <- line
-	}
-}
-
-func (c *Client) Write() {
-	for data := range c.outgoing {
-		c.writer.WriteString(data)
-		c.writer.Flush()
-	}
+	id     string
+	conn   net.Conn
+	reader *bufio.Reader
+	writer *bufio.Writer
+	send   chan string
+	recv   chan string
 }
 
 func (c *Client) Listen() {
-	go c.Read()
-	go c.Write()
+	for {
+		select {
+		case s := <-c.send:
+			c.write(s)
+			/*case s := <-c.incoming:
+			case s := <-c.outgoing:
+				c.conn.Write([]byte(s))
+			case <-c.quit:
+				c.Close()
+				return*/
+		}
+	}
+	//read server messages and relay to client
+	//read client messages and relay to server (server relays to other clients in the room)
+}
+
+func (c Client) write(s string) {
+	c.writer.WriteString(s)
 }
 
 func (c *Client) Close() {
-	close(c.incoming)
-	close(c.outgoing)
+	c.write("server is closing the connection\n")
+	c.conn.Close()
 }
 
-func NewClient(c net.Conn, quit chan *Client) *Client {
-	writer := bufio.NewWriter(c)
-	reader := bufio.NewReader(c)
+func NewClient(conn net.Conn) *Client {
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
 
 	client := &Client{
-		id:       c.RemoteAddr().String(),
-		incoming: make(chan string),
-		outgoing: make(chan string),
-		quit:     quit,
-		reader:   reader,
-		writer:   writer,
+		id:     conn.RemoteAddr().String(),
+		conn:   conn,
+		reader: reader,
+		writer: writer,
+		send:   make(chan string),
+		recv:   make(chan string),
 	}
 
-	client.Listen()
+	/*go func(id string, reader io.Reader) {
+		r := bufio.NewReader(reader)
+		for {
+			s, err := r.ReadString('\n')
+			if err != nil {
+				log.Println("error reading message from client: ", err)
+				continue
+			}
+
+			messages <- message{clientId: id, text: s}
+		}
+	}(client.id, conn)*/
+
+	go client.Listen()
+
 	return client
 }
 
-type ChatRoom struct {
-	clients  []*Client
-	joins    chan net.Conn
-	quits    chan *Client
-	incoming chan string
-	outgoing chan string
+type message struct {
+	clientId string
+	text     string
 }
 
-func (c *ChatRoom) Broadcast(data string) {
-	log.Printf("received data: %s", data)
+type ChatRoom struct {
+	id          string
+	clients     []*Client
+	conn        net.Listener
+	joins       chan net.Conn
+	disconnects chan *Client
+	messages    chan message
+	quit        chan struct{}
+}
+
+func (c *ChatRoom) broadcast(msg message) {
+	log.Printf("received data: %s", msg.text)
 	for _, client := range c.clients {
-		client.outgoing <- data
+		if client.id != msg.clientId {
+			client.send <- msg.text
+		}
 	}
 }
 
-func (c *ChatRoom) Join(conn net.Conn) {
+func (chat *ChatRoom) join(conn net.Conn) {
 	log.Printf("Creating client: %s\n", conn.RemoteAddr())
-	client := NewClient(conn, c.quits)
-	client.outgoing <- "Welcome\n"
-	c.clients = append(c.clients, client)
+	client := NewClient(conn)
+	client.send <- "Welcome\n"
+	chat.clients = append(chat.clients, client)
+
 	go func() {
 		for {
-			c.incoming <- <-client.incoming
+			s := <-client.recv
+			chat.messages <- message{clientId: client.id, text: s}
 		}
 	}()
 }
 
-func (cr *ChatRoom) remove(client *Client) {
+func (chat *ChatRoom) remove(client *Client) {
 	//cut the client from the slice
-	for i, c := range cr.clients {
+	for i, c := range chat.clients {
 		if c.id == client.id {
 			c.Close()
 			log.Printf("Client %s has left the room", c.id)
 
-			copy(cr.clients[i:], cr.clients[i+1:])
-			cr.clients = cr.clients[:len(cr.clients)-1]
+			copy(chat.clients[i:], chat.clients[i+1:])
+			chat.clients = chat.clients[:len(chat.clients)-1]
 			return
 		}
 	}
 }
 
 func (c *ChatRoom) Listen() {
+	log.Printf("Listening in chatroom: %s\n", c.conn.Addr().String())
+
+	for {
+		select {
+		case msg := <-c.messages:
+			c.broadcast(msg)
+		case conn := <-c.joins:
+			c.join(conn)
+		case client := <-c.disconnects:
+			c.remove(client)
+		case <-c.quit:
+			log.Println("closed chatroom")
+			return
+		}
+	}
+}
+
+func NewChatRoom(addr string) (*ChatRoom, error) {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	chatRoom := &ChatRoom{
+		id:          listener.Addr().String(),
+		conn:        listener,
+		clients:     make([]*Client, 0),
+		joins:       make(chan net.Conn),
+		disconnects: make(chan *Client),
+		messages:    make(chan message),
+		quit:        make(chan struct{}),
+	}
+
 	go func() {
 		for {
-			select {
-			case data := <-c.incoming:
-				c.Broadcast(data)
-			case conn := <-c.joins:
-				c.Join(conn)
-			case client := <-c.quits:
-				c.remove(client)
+			client, err := listener.Accept()
+			if err != nil {
+				log.Println("error connecting client ", err)
 			}
+
+			chatRoom.joins <- client
 		}
 	}()
+
+	go func() {
+		r := bufio.NewReader(os.Stdin)
+		for {
+			s, err := r.ReadString('\n')
+			if err != nil {
+				log.Println(err)
+				return
+			}
+
+			if quitCmd.MatchString(s) {
+				chatRoom.quit <- struct{}{}
+				return
+			}
+
+			log.Println("sending message ", s)
+			chatRoom.messages <- message{clientId: chatRoom.id, text: s}
+		}
+	}()
+
+	return chatRoom, nil
 }
 
-func NewChatRoom() *ChatRoom {
-	chatRoom := &ChatRoom{
-		clients:  make([]*Client, 0),
-		joins:    make(chan net.Conn),
-		quits:    make(chan *Client),
-		incoming: make(chan string),
-		outgoing: make(chan string),
+func (chat *ChatRoom) Close() {
+	//issue disconnect to all clients
+	for _, client := range chat.clients {
+		client.conn.Write([]byte("server is closing the chatroom\nquit\n"))
+		client.conn.Close()
 	}
 
-	chatRoom.Listen()
-	return chatRoom
+	//cleanup the chatroom
+	chat.conn.Close()
 }
+
+var quitCmd = regexp.MustCompile("^quit\r?\n$")
 
 func main() {
-	chatRoom := NewChatRoom()
-
-	l, err := net.Listen("tcp", ":8888")
+	chatRoom, err := NewChatRoom(":8888")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("could not create chatroom ", err)
 	}
-	defer l.Close()
+	defer chatRoom.Close()
 
-	log.Printf("Created Server on: %s\n", l.Addr())
-	for {
-		conn, _ := l.Accept()
-		chatRoom.joins <- conn
-	}
+	chatRoom.Listen()
 }
