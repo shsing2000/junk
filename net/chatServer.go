@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -13,8 +14,9 @@ type Client struct {
 	conn   net.Conn
 	reader *bufio.Reader
 	writer *bufio.Writer
-	send   chan string
 	recv   chan string
+	send   chan string
+	quit   chan struct{}
 }
 
 func (c *Client) Listen() {
@@ -22,12 +24,9 @@ func (c *Client) Listen() {
 		select {
 		case s := <-c.send:
 			c.write(s)
-			/*case s := <-c.incoming:
-			case s := <-c.outgoing:
-				c.conn.Write([]byte(s))
-			case <-c.quit:
-				c.Close()
-				return*/
+		case <-c.quit:
+			c.Close()
+			return
 		}
 	}
 	//read server messages and relay to client
@@ -58,22 +57,24 @@ func NewClient(conn net.Conn) *Client {
 		conn:   conn,
 		reader: reader,
 		writer: writer,
-		send:   make(chan string),
 		recv:   make(chan string),
+		send:   make(chan string),
+		quit:   make(chan struct{}),
 	}
 
-	/*go func(id string, reader io.Reader) {
+	go func(reader io.Reader) {
 		r := bufio.NewReader(reader)
 		for {
 			s, err := r.ReadString('\n')
 			if err != nil {
 				log.Println("error reading message from client: ", err)
+				//if err.WSARecv, return
 				continue
 			}
 
-			messages <- message{clientId: id, text: s}
+			client.recv <- s
 		}
-	}(client.id, conn)*/
+	}(conn)
 
 	go client.Listen()
 
