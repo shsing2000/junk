@@ -34,8 +34,14 @@ func (c *Client) Listen() {
 	//read client messages and relay to server (server relays to other clients in the room)
 }
 
-func (c Client) write(s string) {
-	c.writer.WriteString(s)
+func (c *Client) write(s string) {
+	_, err := c.writer.WriteString(s)
+	if err != nil {
+		log.Printf("error writing message for %s: %s\n", c.id, s)
+		return
+	}
+
+	c.writer.Flush()
 }
 
 func (c *Client) Close() {
