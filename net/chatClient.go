@@ -85,7 +85,7 @@ func readMessages(rd io.Reader, dst chan string, quit chan struct{}) {
 			return
 		}
 
-		log.Printf("sending: %s", s)
+		//log.Printf("msg: %s", s)
 		dst <- s
 	}
 }

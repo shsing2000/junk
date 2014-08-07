@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -23,20 +24,20 @@ func (c *Client) Listen() {
 	for {
 		select {
 		case s := <-c.send:
+			//chatserver sent a message to the client
 			c.write(s)
 		case <-c.quit:
+			//chat server initiating a quit
 			c.Close()
 			return
 		}
 	}
-	//read server messages and relay to client
-	//read client messages and relay to server (server relays to other clients in the room)
 }
 
 func (c *Client) write(s string) {
 	_, err := c.writer.WriteString(s)
 	if err != nil {
-		log.Printf("error writing message for %s: %s\n", c.id, s)
+		//log.Printf("error writing message for %s: %s %v\n", c.id, s, err)
 		return
 	}
 
@@ -48,7 +49,7 @@ func (c *Client) Close() {
 	c.conn.Close()
 }
 
-func NewClient(conn net.Conn) *Client {
+func NewClient(conn net.Conn, chat *ChatRoom) *Client {
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
@@ -64,12 +65,24 @@ func NewClient(conn net.Conn) *Client {
 
 	go func(reader io.Reader) {
 		r := bufio.NewReader(reader)
+		defer client.Close()
+
 		for {
 			s, err := r.ReadString('\n')
 			if err != nil {
+				if nerr, ok := err.(net.Error); ok && nerr.Temporary() {
+					continue
+				}
+
 				log.Println("error reading message from client: ", err)
-				//if err.WSARecv, return
-				continue
+				chat.disconnects <- client
+				return
+			}
+
+			if quitCmd.MatchString(s) {
+				log.Println("client disconnected")
+				chat.disconnects <- client
+				return
 			}
 
 			client.recv <- s
@@ -97,18 +110,27 @@ type ChatRoom struct {
 }
 
 func (c *ChatRoom) broadcast(msg message) {
-	log.Printf("received data: %s", msg.text)
+	//log.Printf("received data: %s", msg.text)
+	var s string
+	if msg.clientId != "" {
+		s = fmt.Sprintf("%s says: %s", msg.clientId, msg.text)
+	} else {
+		s = msg.text
+	}
+
 	for _, client := range c.clients {
 		if client.id != msg.clientId {
-			client.send <- msg.text
+			client.send <- s
 		}
 	}
 }
 
 func (chat *ChatRoom) join(conn net.Conn) {
-	log.Printf("Creating client: %s\n", conn.RemoteAddr())
-	client := NewClient(conn)
+	m := fmt.Sprintf("Client %s has joined the room\n", conn.RemoteAddr())
+	log.Printf(m)
+	client := NewClient(conn, chat)
 	client.send <- "Welcome\n"
+	chat.broadcast(message{text: m})
 	chat.clients = append(chat.clients, client)
 
 	go func() {
@@ -124,10 +146,12 @@ func (chat *ChatRoom) remove(client *Client) {
 	for i, c := range chat.clients {
 		if c.id == client.id {
 			c.Close()
-			log.Printf("Client %s has left the room", c.id)
+			s := fmt.Sprintf("Client %s has left the room", c.id)
+			log.Printf(s)
 
 			copy(chat.clients[i:], chat.clients[i+1:])
 			chat.clients = chat.clients[:len(chat.clients)-1]
+			chat.broadcast(message{text: s})
 			return
 		}
 	}
