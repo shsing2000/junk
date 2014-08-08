@@ -146,7 +146,7 @@ func (chat *ChatRoom) remove(client *Client) {
 	for i, c := range chat.clients {
 		if c.id == client.id {
 			c.Close()
-			s := fmt.Sprintf("Client %s has left the room", c.id)
+			s := fmt.Sprintf("Client %s has left the room\n", c.id)
 			log.Printf(s)
 
 			copy(chat.clients[i:], chat.clients[i+1:])
